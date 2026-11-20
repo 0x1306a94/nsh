@@ -6,7 +6,9 @@
 //! holds the Rust runtime (`nsh-platform-ios` with feature `embed`, built as
 //! a static library) and the `NativeShell` Swift module
 //! (`crates/nsh-platform-ios/swift`), compiled with library evolution so apps
-//! built with other Swift compilers can import it (`.swiftinterface`). The C
+//! built with other Swift compilers can import it (`.swiftinterface`).
+//! Objective-C `@import NativeShell` (the module map exports
+//! `Headers/NativeShell-Swift.h`). The C
 //! ABI (`NativeShellC`) is only used to compile the Swift module and is not
 //! shipped.
 //!
@@ -266,6 +268,8 @@ fn compile_swift(
         .arg(module.with_extension("swiftmodule"))
         .arg("-emit-module-interface-path")
         .arg(module.with_extension("swiftinterface"))
+        .arg("-emit-objc-header-path")
+        .arg(dir.join("NativeShell-Swift.h"))
         .arg("-I")
         .arg(crate_dir.join("include"))
         .arg(crate_dir.join("swift/NativeShell.swift"))
@@ -373,6 +377,7 @@ fn make_framework(
         }
     }
     fs::write(resources.join("Info.plist"), info_plist(platform))?;
+    install_objc_header(&contents, swift)?;
     if platform.versioned {
         let link = |target: &str, name: &str| -> anyhow::Result<()> {
             symlink(target, &framework.join(name)).with_context(|| format!("link {name}"))
@@ -381,7 +386,35 @@ fn make_framework(
         link("Versions/Current/NativeShell", "NativeShell")?;
         link("Versions/Current/Modules", "Modules")?;
         link("Versions/Current/Resources", "Resources")?;
+        link("Versions/Current/Headers", "Headers")?;
     }
+    Ok(())
+}
+
+/// The generated header and the module map, so Objective-C can
+/// `@import NativeShell` (and still `#import <NativeShell/NativeShell-Swift.h>`).
+/// One slice's header is enough: the public interface does not differ by
+/// architecture.
+fn install_objc_header(contents: &Path, swift: &[PathBuf]) -> anyhow::Result<()> {
+    let header = swift
+        .iter()
+        .map(|dir| dir.join("NativeShell-Swift.h"))
+        .find(|path| path.is_file())
+        .context("NativeShell-Swift.h was not emitted")?;
+    let headers = contents.join("Headers");
+    fs::create_dir_all(&headers)?;
+    copy(&header, &headers.join("NativeShell-Swift.h"))?;
+    let modules = contents.join("Modules");
+    fs::create_dir_all(&modules)?;
+    fs::write(
+        modules.join("module.modulemap"),
+        "\
+framework module NativeShell {
+    header \"NativeShell-Swift.h\"
+    export *
+}
+",
+    )?;
     Ok(())
 }
 

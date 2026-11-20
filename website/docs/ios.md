@@ -139,7 +139,7 @@ imports any of its components. A host app that builds the runtime with Rust code
 1. Drag `NativeShell.xcframework` (or `NativeShellDev.xcframework` for development builds) into the app target's
    **Frameworks, Libraries, and Embedded Content**. Choose **Do Not Embed** for the default static frameworks,
    or **Embed & Sign** for dynamic frameworks built with `--dynamic`.
-2. In Swift, `import NativeShell`.
+2. In Swift, `import NativeShell`. In Objective-C, `@import NativeShell`.
 3. In the app's `Info.plist`, set `CADisableMinimumFrameDurationOnPhone` to `YES`: on ProMotion iPhones the app's
    animations then move at 120 Hz, as scrolling does (apps built by `nsh package` have it).
 
@@ -383,13 +383,13 @@ app.limits = NshLimits(memoryMB: 128, callBudget: 1, maxNodes: 50_000)
 
 | `NshLimits` field | Default | Meaning |
 |---|---|---|
-| `memoryMB: UInt32?` | 256 | JS heap in MB. Running out stops the app. |
-| `stackKB: UInt32?` | 4096 (also the maximum) | Interpreter stack in KB. Deeper recursion throws a `RangeError`. |
-| `loadBudget: TimeInterval?` | 10 s | Time to evaluate the bundle. |
-| `callBudget: TimeInterval?` | 2 s | Time of any other call into JS (one event, one timer, one frame). An overrun call is cut off. |
-| `maxNodes: UInt32?` | 200 000 | Nodes the app may keep. |
+| `memoryMB: UInt32` | 256 | JS heap in MB. Running out stops the app. |
+| `stackKB: UInt32` | 4096 (also the maximum) | Interpreter stack in KB. Deeper recursion throws a `RangeError`. |
+| `loadBudget: TimeInterval` | 10 s | Time to evaluate the bundle. |
+| `callBudget: TimeInterval` | 2 s | Time of any other call into JS (one event, one timer, one frame). An overrun call is cut off. |
+| `maxNodes: UInt32` | 200 000 | Nodes the app may keep. |
 
-`nil` keeps the default. What each limit does when it is hit: [Sandbox and capabilities](./sandbox-and-capabilities.md).
+`0` keeps the default. `NshLimits` is a class: `app.limits.memoryMB = 128` writes through to that view (the same object Objective-C holds). What each limit does when it is hit: [Sandbox and capabilities](./sandbox-and-capabilities.md).
 
 ## Capabilities
 
@@ -467,6 +467,35 @@ updates the app in place, logs appear in the `nsh dev` terminal, and errors show
 > [!NOTE]
 > On a device, the connection to your Mac is ordinary local network traffic over plain `ws://` and `http://` (assets).
 > iOS may ask the user for local network access, and the app's App Transport Security settings must allow it.
+
+## Objective-C
+
+The same `NshAppView` is a `UIView`. Throwing methods take an `NSError **`. `async` Swift methods have a completion handler; members that are Swift structs or closures have an Objective-C name beside them.
+
+```objc
+@import NativeShell;
+
+NshAppView *app = [[NshAppView alloc] initWithFrame:container.bounds];
+[container addSubview:app];
+app.onError = ^(NSString *message) { NSLog(@"%@", message); };
+app.limits.memoryMB = 128;          // 0 keeps a default
+NSError *error = nil;
+[app loadBundleAtURL:bundleURL error:&error];
+```
+
+| Objective-C | Swift |
+|---|---|
+| `loadBundleAtURL:error:` | `loadBundle(at:)` |
+| `loadPackageAtURL:trust:completion:` | `loadPackage(at:trust:)`. The completion runs on the main thread. |
+| `openPackageAtURL:completion:` on `NshTrust` | `openPackage(at:)`. The completion runs off the main thread; `run:` still wants the main thread. |
+| `localeIdentifier`, `fontScaleNumber` | `locale`, `fontScale`. `nil` follows the system. |
+| `setCacheLocation:directory:imagePolicy:imageMaxMegabytes:` | `cacheOptions`. `directory` is used for `NshCacheLocationDirectory`; without one, the location stays the system's. Read back with `cacheLocation`, `cacheDirectory`, `imageCachePolicy`, `imageCacheMaxMegabytes`. |
+| `packageInfo.appId` | `info.id` |
+| `registerComponentWithName:factory:` | `register(component:)`. The factory returns an object conforming to `NshComponent` (`view`, `setProp:value:`; `command:args:`, `setAnimatedNumber:value:` and `setAnimatedColor:argb:` are optional). |
+| `handleCall:handler:` | `handle`. The block runs on the main thread. The `async` overload is Swift-only. |
+| `watchScrollWithNativeID:watcher:` | `watchScroll`. The watcher conforms to `NshScrollWatcher`. |
+| `supportedInterfaceOrientationMask` | `supportedInterfaceOrientations`. `0` means the controller's own mask. |
+| `addScrollListener:`, `addContentSizeListener:`, `removeListener:` | `onScroll`, `onContentSizeChange`. The returned id is `0` when the scroll view is already gone. |
 
 ## Notes
 

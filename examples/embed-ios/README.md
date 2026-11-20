@@ -5,7 +5,7 @@ native views.
 
 1. Add `dist/nsh/embed/ios/NativeShell.xcframework` (or `NativeShellDev.xcframework` for
    development builds) to the app target (`cargo xtask ios-embed` builds both). Swift code then
-   `import NativeShell`.
+   `import NativeShell`; Objective-C uses `@import NativeShell`.
 2. Build the NSH bundle and add the output folder to the app's resources as
    `nsh`: `nsh build ../embedded --release --out nsh`.
 3. Create an `NshAppView` (a `UIView`), add it to a view hierarchy and call

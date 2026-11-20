@@ -127,7 +127,7 @@ cargo xtask ios-embed --dynamic
 1. 把 `NativeShell.xcframework`（开发构建则用 `NativeShellDev.xcframework`）拖到应用 target 的
    **Frameworks, Libraries, and Embedded Content** 中。默认的静态 framework 选择 **Do Not Embed**；
    使用 `--dynamic` 构建的动态 framework 选择 **Embed & Sign**。
-2. 在 Swift 中 `import NativeShell`。
+2. Swift 里 `import NativeShell`。Objective-C 里 `@import NativeShell`。
 3. 在应用的 `Info.plist` 中把 `CADisableMinimumFrameDurationOnPhone` 设为 `YES`：在 ProMotion iPhone 上，应用的动画
    就会像滚动一样以 120 Hz 运行（`nsh package` 构建的应用已经设置）。
 
@@ -354,13 +354,13 @@ app.limits = NshLimits(memoryMB: 128, callBudget: 1, maxNodes: 50_000)
 
 | `NshLimits` 字段 | 默认值 | 含义 |
 |---|---|---|
-| `memoryMB: UInt32?` | 256 | JS 堆大小（MB）。耗尽时应用停止。 |
-| `stackKB: UInt32?` | 4096（也是上限） | 解释器栈大小（KB）。递归更深会抛出 `RangeError`。 |
-| `loadBudget: TimeInterval?` | 10 s | 执行 bundle 的时间。 |
-| `callBudget: TimeInterval?` | 2 s | 其他每次 JS 调用（一个事件、一个定时器、一帧）的时间。超时的调用会被中断。 |
-| `maxNodes: UInt32?` | 200 000 | 应用可保留的节点数。 |
+| `memoryMB: UInt32` | 256 | JS 堆大小（MB）。耗尽时应用停止。 |
+| `stackKB: UInt32` | 4096（也是上限） | 解释器栈大小（KB）。递归更深会抛出 `RangeError`。 |
+| `loadBudget: TimeInterval` | 10 s | 执行 bundle 的时间。 |
+| `callBudget: TimeInterval` | 2 s | 其他每次 JS 调用（一个事件、一个定时器、一帧）的时间。超时的调用会被中断。 |
+| `maxNodes: UInt32` | 200 000 | 应用可保留的节点数。 |
 
-`nil` 表示使用默认值。各项限制触发时会发生什么，见[沙箱与能力](./sandbox-and-capabilities.md)。
+`0` 表示使用默认值。`NshLimits` 是类：`app.limits.memoryMB = 128` 会写到这个视图上（Objective-C 拿到的是同一个对象）。各项限制触发时会发生什么，见[沙箱与能力](./sandbox-and-capabilities.md)。
 
 ## 能力
 
@@ -434,6 +434,35 @@ try app.loadBundle(at: bundledURL)
 > [!NOTE]
 > 在真机上，与 Mac 的连接是普通的本地网络流量，使用明文的 `ws://` 和 `http://`（资源）。iOS 可能会请求用户授予本地网络访问权限，应用的
 > App Transport Security 设置也必须允许这种连接。
+
+## Objective-C
+
+同一个 `NshAppView` 就是 `UIView`。会抛错的方法带 `NSError **`。Swift 的 `async` 方法有完成回调；struct 和「返回闭包」的成员在 Objective-C 里用旁边的名字。
+
+```objc
+@import NativeShell;
+
+NshAppView *app = [[NshAppView alloc] initWithFrame:container.bounds];
+[container addSubview:app];
+app.onError = ^(NSString *message) { NSLog(@"%@", message); };
+app.limits.memoryMB = 128;          // 0 表示默认
+NSError *error = nil;
+[app loadBundleAtURL:bundleURL error:&error];
+```
+
+| Objective-C | Swift |
+|---|---|
+| `loadBundleAtURL:error:` | `loadBundle(at:)` |
+| `loadPackageAtURL:trust:completion:` | `loadPackage(at:trust:)`。完成回调在主线程。 |
+| `NshTrust` 的 `openPackageAtURL:completion:` | `openPackage(at:)`。完成回调不在主线程；`run:` 仍要在主线程调用。 |
+| `localeIdentifier`、`fontScaleNumber` | `locale`、`fontScale`。`nil` 跟随系统。 |
+| `setCacheLocation:directory:imagePolicy:imageMaxMegabytes:` | `cacheOptions`。`NshCacheLocationDirectory` 才使用 `directory`；不传目录时位置保持系统缓存。用 `cacheLocation`、`cacheDirectory`、`imageCachePolicy`、`imageCacheMaxMegabytes` 读回。 |
+| `packageInfo.appId` | `info.id` |
+| `registerComponentWithName:factory:` | `register(component:)`。工厂返回遵守 `NshComponent` 的对象（`view`、`setProp:value:`；`command:args:`、`setAnimatedNumber:value:`、`setAnimatedColor:argb:` 可选）。 |
+| `handleCall:handler:` | `handle`。block 在主线程调用。`async` 那个重载只有 Swift。 |
+| `watchScrollWithNativeID:watcher:` | `watchScroll`。监听者遵守 `NshScrollWatcher`。 |
+| `supportedInterfaceOrientationMask` | `supportedInterfaceOrientations`。`0` 表示用控制器自己的方向。 |
+| `addScrollListener:`、`addContentSizeListener:`、`removeListener:` | `onScroll`、`onContentSizeChange`。返回的 id 为 `0` 表示滚动视图已经不在了。 |
 
 ## 注意事项
 

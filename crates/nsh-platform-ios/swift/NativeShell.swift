@@ -11,6 +11,11 @@
 //     try trust.addRoot("<root.pub>")
 //     try await app.loadPackage(at: downloaded, trust: trust)
 //
+// Objective-C `@import NativeShell` (or `#import <NativeShell/NativeShell-Swift.h>`).
+// The same view is an `NshAppView`; members Swift cannot express in Objective-C
+// (`async`, structs, closures that return closures) have an Objective-C method
+// next to them.
+//
 // Built over the C ABI of `src/embed.rs` (`include/nsh.h`), imported
 // privately: apps only see this module.
 
@@ -72,34 +77,83 @@ public struct NshCacheOptions: Equatable, Sendable {
     }
 }
 
-/// The VM limits of an app (`nil`: the default).
-public struct NshLimits: Sendable, Equatable {
+/// The VM limits of an app. `0` keeps that limit's default. A reference:
+/// changing a field of the instance an `NshAppView` holds applies to the apps
+/// it loads from then on, and so does assigning another instance.
+@objc(NshLimits)
+public final class NshLimits: NSObject, @unchecked Sendable {
     /// JS heap in MB (default 256, for an app embedded in another). Running out stops the app.
-    public var memoryMB: UInt32?
+    @objc public var memoryMB: UInt32 = 0 { didSet { changed() } }
     /// Interpreter stack in KB (default 4096, also the maximum).
-    public var stackKB: UInt32?
+    @objc public var stackKB: UInt32 = 0 { didSet { changed() } }
     /// Time to evaluate the bundle, in seconds (default 10).
-    public var loadBudget: TimeInterval?
+    @objc public var loadBudget: TimeInterval = 0 { didSet { changed() } }
     /// Time of any other call into JS (one event, timer or frame), in
     /// seconds (default 2). An overrun call is cut off.
-    public var callBudget: TimeInterval?
+    @objc public var callBudget: TimeInterval = 0 { didSet { changed() } }
     /// Nodes the app may keep (default 200 000).
-    public var maxNodes: UInt32?
+    @objc public var maxNodes: UInt32 = 0 { didSet { changed() } }
 
-    /// Limits; `nil` keeps a default.
-    public init(
-        memoryMB: UInt32? = nil,
-        stackKB: UInt32? = nil,
-        loadBudget: TimeInterval? = nil,
-        callBudget: TimeInterval? = nil,
-        maxNodes: UInt32? = nil
+    /// Set while this instance is ``NshAppView/limits``.
+    private var onChange: (() -> Void)?
+
+    /// Defaults (`0`).
+    public override init() {
+        super.init()
+    }
+
+    /// Limits; `0` keeps a default.
+    public convenience init(
+        memoryMB: UInt32 = 0,
+        stackKB: UInt32 = 0,
+        loadBudget: TimeInterval = 0,
+        callBudget: TimeInterval = 0,
+        maxNodes: UInt32 = 0
     ) {
+        self.init()
         self.memoryMB = memoryMB
         self.stackKB = stackKB
         self.loadBudget = loadBudget
         self.callBudget = callBudget
         self.maxNodes = maxNodes
     }
+
+    fileprivate func bind(_ onChange: @escaping () -> Void) {
+        self.onChange = onChange
+    }
+
+    fileprivate func unbind() { onChange = nil }
+
+    private func changed() { onChange?() }
+
+    /// Field by field.
+    public static func == (lhs: NshLimits, rhs: NshLimits) -> Bool {
+        lhs.memoryMB == rhs.memoryMB && lhs.stackKB == rhs.stackKB
+            && lhs.loadBudget == rhs.loadBudget && lhs.callBudget == rhs.callBudget
+            && lhs.maxNodes == rhs.maxNodes
+    }
+}
+
+/// Where an ``NshAppView`` keeps caches, for Objective-C. Swift uses
+/// ``NshCacheOptions/Location``.
+@objc public enum NshCacheLocation: Int {
+    /// `nsh` in the app's Caches.
+    case system
+    /// A directory of the app's choosing.
+    case directory
+    /// Nothing on disk.
+    case off
+}
+
+/// How much of one cache an ``NshAppView`` keeps, for Objective-C. Swift uses
+/// ``NshCacheOptions/Policy``.
+@objc public enum NshImageCachePolicy: Int {
+    /// The default size (images: 256 MB).
+    case standard
+    /// At most ``NshAppView/imageCacheMaxMegabytes``.
+    case maxSize
+    /// Not kept on disk.
+    case off
 }
 
 /// Holds an error handler for the C callback.
@@ -119,10 +173,22 @@ public final class NshAppView: UIView {
     private var openURLHandler: (@MainActor (URL) -> Bool)?
 
     /// Creates the view. `trace` logs per-commit timings.
-    public init(frame: CGRect = .zero, trace: Bool = false) {
+    @objc(initWithFrame:trace:)
+    public init(frame: CGRect, trace: Bool) {
         app = nsh_app_create(frame, trace)
         super.init(frame: frame)
         attach()
+    }
+
+    /// Creates the view. `trace` is off. Objective-C's `initWithFrame:` and
+    /// `NshAppView()` (UIKit's `init`, which calls this) land here.
+    public convenience override init(frame: CGRect) {
+        self.init(frame: frame, trace: false)
+    }
+
+    /// Creates the view with a zero frame. `NshAppView(trace:)`.
+    public convenience init(trace: Bool = false) {
+        self.init(frame: .zero, trace: trace)
     }
 
     /// Creates the view from a storyboard or nib.
@@ -137,6 +203,7 @@ public final class NshAppView: UIView {
         content.frame = bounds
         content.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         addSubview(content)
+        bindLimits()
     }
 
     deinit {
@@ -147,7 +214,7 @@ public final class NshAppView: UIView {
     /// Receives fatal app errors (load failures, uncaught JS exceptions) on
     /// the main thread. They are always logged; development builds also
     /// show them over the app.
-    public var onError: ((String) -> Void)? {
+    @objc public var onError: ((String) -> Void)? {
         didSet {
             guard let onError else {
                 nsh_app_set_error_handler(app, nil, nil, nil)
@@ -166,16 +233,30 @@ public final class NshAppView: UIView {
         }
     }
 
-    /// The VM limits of the apps loaded from now on.
-    public var limits = NshLimits() {
+    /// The VM limits of the apps loaded from now on. Assigning replaces them;
+    /// changing a field of this instance does too (`0` keeps a default).
+    @objc public var limits = NshLimits() {
         didSet {
-            let ms = { (seconds: TimeInterval?) -> UInt32 in
-                seconds.map { UInt32(clamping: Int(($0 * 1000).rounded())) } ?? 0
-            }
-            nsh_app_set_limits(
-                app, limits.memoryMB ?? 0, limits.stackKB ?? 0, ms(limits.loadBudget),
-                ms(limits.callBudget), limits.maxNodes ?? 0)
+            oldValue.unbind()
+            bindLimits()
         }
+    }
+
+    private func bindLimits() {
+        limits.bind { [weak self] in
+            MainActor.assumeIsolated { self?.applyLimits() }
+        }
+        applyLimits()
+    }
+
+    private func applyLimits() {
+        let ms = { (seconds: TimeInterval) -> UInt32 in
+            guard seconds > 0 else { return 0 }
+            return UInt32(clamping: Int((seconds * 1000).rounded()))
+        }
+        nsh_app_set_limits(
+            app, limits.memoryMB, limits.stackKB, ms(limits.loadBudget),
+            ms(limits.callBudget), limits.maxNodes)
     }
 
     /// Whether scroll views make the views of their content only near their
@@ -184,7 +265,7 @@ public final class NshAppView: UIView {
     /// scroll view into an image (a long screenshot); turned on again, what
     /// is far away is given up. Applies to the running app and the apps
     /// loaded from now on.
-    public var contentCulling = true {
+    @objc public var contentCulling = true {
         didSet { nsh_app_set_content_culling(app, contentCulling) }
     }
 
@@ -198,7 +279,7 @@ public final class NshAppView: UIView {
     /// URL in its `userInfo["url"]`: pass it to ``openURL(_:)``. Applies from
     /// the next load: a change removes the running app, as ``limits`` does.
     /// Off by default.
-    public var handoff = false {
+    @objc public var handoff = false {
         didSet { nsh_app_set_handoff(app, handoff) }
     }
 
@@ -206,7 +287,7 @@ public final class NshAppView: UIView {
     /// on is kept in. `nil`: each app's own, `nsh/<app id>` in the app's
     /// Application Support (the id of `nsh.json`, `nsh/default` without
     /// one).
-    public var storageDirectory: URL? {
+    @objc public var storageDirectory: URL? {
         didSet {
             // A file path is always UTF-8, so this cannot fail.
             try? check(nsh_app_set_storage_directory(app, storageDirectory?.path))
@@ -249,6 +330,60 @@ public final class NshAppView: UIView {
         }
     }
 
+    /// ``NshCacheOptions/location``, for Objective-C.
+    @objc public var cacheLocation: NshCacheLocation {
+        switch cacheOptions.location {
+        case .system: return .system
+        case .directory: return .directory
+        case .off: return .off
+        }
+    }
+
+    /// The directory when ``cacheLocation`` is `.directory`.
+    @objc public var cacheDirectory: URL? {
+        if case .directory(let url) = cacheOptions.location { return url }
+        return nil
+    }
+
+    /// ``NshCacheOptions/images``, for Objective-C.
+    @objc public var imageCachePolicy: NshImageCachePolicy {
+        switch cacheOptions.images {
+        case .default: return .standard
+        case .maxSize: return .maxSize
+        case .off: return .off
+        }
+    }
+
+    /// The cap when ``imageCachePolicy`` is `.maxSize`, in megabytes (MiB).
+    @objc public var imageCacheMaxMegabytes: Int {
+        if case .maxSize(let megabytes) = cacheOptions.images { return megabytes }
+        return 0
+    }
+
+    /// Replaces ``cacheOptions``. `directory` is used when `location` is
+    /// `.directory`; without one, the location stays the system's. Applies
+    /// from the next load.
+    @objc(setCacheLocation:directory:imagePolicy:imageMaxMegabytes:)
+    public func setCache(
+        location: NshCacheLocation, directory: URL?, imagePolicy: NshImageCachePolicy,
+        imageMaxMegabytes: Int
+    ) {
+        let whereCaches: NshCacheOptions.Location
+        switch location {
+        case .system: whereCaches = .system
+        case .off: whereCaches = .off
+        case .directory:
+            whereCaches = directory.map { .directory($0) } ?? .system
+        }
+        let images: NshCacheOptions.Policy
+        switch imagePolicy {
+        case .standard: images = .default
+        case .off: images = .off
+        case .maxSize: images = .maxSize(megabytes: imageMaxMegabytes)
+        }
+        cacheOptions = NshCacheOptions(location: whereCaches, images: images)
+    }
+
     /// The host app's language, standing in for the user's: what `Intl`
     /// formats for by default and what `locale()` (`nsh/device`) reads, at
     /// once and for every app loaded later. `nil` follows the system's.
@@ -269,13 +404,26 @@ public final class NshAppView: UIView {
         }
     }
 
+    /// ``locale``, for Objective-C (`nil`: the system's). A `Locale` identifier
+    /// such as `zh_Hans_CN`.
+    @objc public var localeIdentifier: String? {
+        get { locale?.identifier }
+        set { locale = newValue.map { Locale(identifier: $0) } }
+    }
+
+    /// ``fontScale``, for Objective-C (`nil`: the system's).
+    @objc public var fontScaleNumber: NSNumber? {
+        get { fontScale.map { NSNumber(value: Double($0)) } }
+        set { fontScale = newValue.map { CGFloat(truncating: $0) } }
+    }
+
     /// The launch parameters of the apps loaded from now on: what the app
     /// reads synchronously at start as `host.params` (`nsh/host`), such as the
     /// conversation a notification opens. Values are JSON objects (`String`,
     /// `NSNumber`, `Bool`, `[Any]`, `[String: Any]`, `NSNull`). A running app
     /// keeps the parameters it started with; later requests are events
     /// (``send(_:_:)``).
-    public var params: [String: Any] = [:] {
+    @objc public var params: [String: Any] = [:] {
         didSet {
             guard let json = jsonText(params) else {
                 return print("[nsh] the parameters are not JSON")
@@ -294,7 +442,7 @@ public final class NshAppView: UIView {
     /// and to every app loaded later, from its first frame. `nil` gives the
     /// app its own theme back. Throws why the file does not parse; the
     /// overrides then stay as they were.
-    public func setThemeOverrides(_ json: String?) throws {
+    @objc public func setThemeOverrides(_ json: String?) throws {
         try check(nsh_app_set_theme_overrides(app, json))
     }
 
@@ -304,7 +452,7 @@ public final class NshAppView: UIView {
     /// loading: a font registered before a load is in that app's first
     /// frame, and one registered while an app runs is used from the next
     /// layout. Throws when `data` is not a font.
-    public func registerFont(_ data: Data) throws {
+    @objc public func registerFont(_ data: Data) throws {
         try data.withUnsafeBytes { raw in
             try check(nsh_app_register_font(
                 app,
@@ -317,19 +465,20 @@ public final class NshAppView: UIView {
     /// Grants the apps loaded from now on at most these capabilities: JSON in
     /// the form of `nsh.json`'s `capabilities` (`nil`: what each app
     /// declares). A request must be allowed by both.
-    public func grantCapabilities(_ json: String?) throws {
+    @objc public func grantCapabilities(_ json: String?) throws {
         try check(nsh_app_set_granted_capabilities(app, json))
     }
 
     /// Runs a bundle written by `nsh build`; assets come from `assets` next
     /// to it. Bytecode (`bundle.nshc`) loads only from inside the app bundle;
     /// elsewhere load `bundle.js`, or use signed packages.
+    @objc(loadBundleAtURL:error:)
     public func loadBundle(at url: URL) throws {
         try check(nsh_app_load_bundle(app, url.path))
     }
 
     /// Runs a verified package (``NshTrust/openPackage(at:)``).
-    public func run(_ package: NshPackage) {
+    @objc public func run(_ package: NshPackage) {
         guard let handle = package.take() else {
             onError?("the package already ran")
             return
@@ -346,23 +495,45 @@ public final class NshAppView: UIView {
         return package.info
     }
 
+    /// ``loadPackage(at:trust:)`` for Objective-C. The completion runs on the
+    /// main thread. `info` is nil when `error` is set; the running app stays.
+    @objc(loadPackageAtURL:trust:completion:)
+    public func loadPackage(
+        at url: URL, trust: NshTrust,
+        completion: @escaping (NshPackageInfo?, Error?) -> Void
+    ) {
+        Task { @MainActor in
+            do {
+                completion(NshPackageInfo(try await loadPackage(at: url, trust: trust)), nil)
+            } catch {
+                completion(nil, error)
+            }
+        }
+    }
+
     /// Development: loads from a `nsh dev` server (`ws://host:port/ws`) and
     /// reloads on every change. Throws without development support
     /// (`NativeShell.xcframework` rather than `NativeShellDev`).
-    public func connectDevServer(_ url: URL) throws {
+    @objc public func connectDevServer(_ url: URL) throws {
         try check(nsh_app_connect_dev_server(app, url.absoluteString))
     }
 
     /// The status bar style the running apps asked for: return it from the
     /// host view controller's `preferredStatusBarStyle`.
-    public static var preferredStatusBarStyle: UIStatusBarStyle { nsh_status_bar_style() }
+    @objc public static var preferredStatusBarStyle: UIStatusBarStyle { nsh_status_bar_style() }
 
     /// Whether the running apps hid the status bar (`prefersStatusBarHidden`).
-    public static var prefersStatusBarHidden: Bool { nsh_status_bar_hidden() }
+    @objc public static var prefersStatusBarHidden: Bool { nsh_status_bar_hidden() }
 
     /// How status bar changes animate (`preferredStatusBarUpdateAnimation`).
-    public static var preferredStatusBarUpdateAnimation: UIStatusBarAnimation {
+    @objc public static var preferredStatusBarUpdateAnimation: UIStatusBarAnimation {
         nsh_status_bar_animation()
+    }
+
+    /// ``supportedInterfaceOrientations`` for Objective-C. Empty (0) means the
+    /// hosting controller's own mask.
+    @objc public static var supportedInterfaceOrientationMask: UIInterfaceOrientationMask {
+        nsh_supported_orientations()
     }
 
     /// The orientations the page shown asked for, `nil` for the controller's own.
@@ -376,18 +547,26 @@ public final class NshAppView: UIView {
 /// verified against. The newest revocation list and the highest build
 /// accepted per app persist in its state directory, and packages' assets are
 /// extracted under it. Thread-safe.
-public final class NshTrust: @unchecked Sendable {
+@objc(NshTrust)
+public final class NshTrust: NSObject, @unchecked Sendable {
     private let handle: OpaquePointer
+
+    /// Not a trust store. Use ``init(stateDirectory:)``.
+    @available(*, unavailable)
+    override init() {
+        fatalError("NshTrust(stateDirectory:)")
+    }
 
     /// Opens (or creates) the store in `stateDirectory`, e.g. under
     /// Application Support. It trusts no key until `addRoot`.
-    public init(stateDirectory: URL) throws {
+    @objc public init(stateDirectory: URL) throws {
         var error: UnsafeMutablePointer<CChar>?
         guard let handle = nsh_trust_create(stateDirectory.path, &error) else {
             try check(error)
             throw NshError(message: "cannot open the trust store")
         }
         self.handle = handle
+        super.init()
     }
 
     deinit {
@@ -396,13 +575,13 @@ public final class NshTrust: @unchecked Sendable {
 
     /// Trusts a root public key (base64, `<name>.pub` from `nsh keygen`):
     /// packages whose release key it certified load.
-    public func addRoot(_ publicKey: String) throws {
+    @objc public func addRoot(_ publicKey: String) throws {
         try check(nsh_trust_add_root(handle, publicKey.trimmingCharacters(in: .whitespacesAndNewlines)))
     }
 
     /// Applies a revocation list (the JSON `nsh revoke` writes) signed by a
     /// trusted root; it must be newer than the one the store has.
-    public func updateRevocations(_ json: String) throws {
+    @objc public func updateRevocations(_ json: String) throws {
         try check(nsh_trust_update_revocations(handle, json))
     }
 
@@ -422,10 +601,50 @@ public final class NshTrust: @unchecked Sendable {
             return NshPackage(package)
         }.value
     }
+
+    /// ``openPackage(at:)`` for Objective-C. The completion runs off the main
+    /// thread; ``NshAppView/run(_:)`` still wants the main thread.
+    @objc(openPackageAtURL:completion:)
+    public func openPackage(at url: URL, completion: @escaping (NshPackage?, Error?) -> Void) {
+        Task.detached(priority: .userInitiated) {
+            do {
+                completion(try await self.openPackage(at: url), nil)
+            } catch {
+                completion(nil, error)
+            }
+        }
+    }
+}
+
+/// ``NshPackage/Info`` for Objective-C. `appId` is the app id.
+@objc(NshPackageInfo)
+public final class NshPackageInfo: NSObject {
+    /// Its id (`com.example.app`).
+    @objc(appId) public let id: String
+    /// Its display name.
+    @objc public let name: String
+    /// Its version string.
+    @objc public let version: String
+    /// Its build number.
+    @objc public let build: UInt64
+
+    fileprivate init(_ info: NshPackage.Info) {
+        id = info.id
+        name = info.name
+        version = info.version
+        build = info.build
+        super.init()
+    }
+
+    @available(*, unavailable)
+    override init() {
+        fatalError("NshPackageInfo comes from a package")
+    }
 }
 
 /// A verified signed package, ready to run once (`NshAppView.run`).
-public final class NshPackage: @unchecked Sendable {
+@objc(NshPackage)
+public final class NshPackage: NSObject, @unchecked Sendable {
     /// The app a package holds.
     public struct Info: Sendable, Equatable {
         /// Its id (`com.example.app`).
@@ -440,8 +659,15 @@ public final class NshPackage: @unchecked Sendable {
 
     /// The app it holds.
     public let info: Info
+    /// ``info`` for Objective-C.
+    @objc public var packageInfo: NshPackageInfo { NshPackageInfo(info) }
     private var handle: OpaquePointer?
     private let lock = NSLock()
+
+    @available(*, unavailable)
+    override init() {
+        fatalError("NshPackage comes from NshTrust")
+    }
 
     fileprivate init(_ handle: OpaquePointer) {
         self.handle = handle
@@ -450,6 +676,7 @@ public final class NshPackage: @unchecked Sendable {
             name: String(cString: nsh_package_app_name(handle)),
             version: String(cString: nsh_package_app_version(handle)),
             build: nsh_package_app_build(handle))
+        super.init()
     }
 
     fileprivate func take() -> OpaquePointer? {
@@ -495,13 +722,71 @@ extension NshComponent {
     public func setAnimatedColor(_ name: String, _ argb: UInt32) { setProp(name, NSNumber(value: argb)) }
 }
 
+/// ``NshComponent`` for Objective-C: an `NSObject` subclass. Optional methods
+/// fall back the way the Swift protocol's defaults do (commands are ignored;
+/// animated props arrive as `setProp:value:` numbers).
+@objc(NshComponent)
+public protocol NshObjCComponent: NSObjectProtocol {
+    /// Its view; it fills the box nsh lays out.
+    var view: UIView { get }
+    /// Prop `name` changed (`nil`: removed).
+    func setProp(_ name: String, value: Any?)
+    /// JS called `ref.command(name, args)`.
+    @objc optional func command(_ name: String, args: Any?)
+    /// Prop `name`, bound to an animated value, moved to `value`.
+    @objc optional func setAnimatedNumber(_ name: String, value: Double)
+    /// Prop `name`, bound to an animated color, moved to `argb` (0xAARRGGBB).
+    @objc optional func setAnimatedColor(_ name: String, argb: UInt32)
+}
+
+/// Forwards to an Objective-C component, including the Swift defaults.
+@MainActor
+private final class ObjCComponentAdapter: NshComponent {
+    let component: NshObjCComponent
+
+    init(_ component: NshObjCComponent) { self.component = component }
+
+    var view: UIView { component.view }
+
+    func setProp(_ name: String, _ value: Any?) {
+        component.setProp(name, value: value)
+    }
+
+    func command(_ name: String, _ args: Any?) {
+        component.command?(name, args: args)
+    }
+
+    func setAnimatedNumber(_ name: String, _ value: Double) {
+        if component.responds(to: #selector(NshObjCComponent.setAnimatedNumber(_:value:))) {
+            component.setAnimatedNumber?(name, value: value)
+        } else {
+            setProp(name, NSNumber(value: value))
+        }
+    }
+
+    func setAnimatedColor(_ name: String, _ argb: UInt32) {
+        if component.responds(to: #selector(NshObjCComponent.setAnimatedColor(_:argb:))) {
+            component.setAnimatedColor?(name, argb: argb)
+        } else {
+            setProp(name, NSNumber(value: argb))
+        }
+    }
+}
+
 /// What a component tells its app: its events and its own size.
 /// Thread-safe.
-public final class NshComponentContext: @unchecked Sendable {
+@objc(NshComponentContext)
+public final class NshComponentContext: NSObject, @unchecked Sendable {
     private let handle: OpaquePointer
+
+    @available(*, unavailable)
+    override init() {
+        fatalError("NshComponentContext comes from nsh")
+    }
 
     fileprivate init(_ handle: OpaquePointer) {
         self.handle = handle
+        super.init()
     }
 
     deinit {
@@ -510,6 +795,7 @@ public final class NshComponentContext: @unchecked Sendable {
 
     /// Emits `event` with `data` (anything `JSONSerialization` takes): the JS
     /// handler `on<Event>` gets it.
+    @objc(emitEvent:data:)
     public func emit(_ event: String, _ data: Any? = nil) {
         guard let data else { return nsh_component_emit(handle, event, nil) }
         guard JSONSerialization.isValidJSONObject([data]),
@@ -522,7 +808,7 @@ public final class NshComponentContext: @unchecked Sendable {
 
     /// The component's own size (points): used where its style leaves a
     /// dimension open (e.g. content-sized views).
-    public func setSize(_ size: CGSize) {
+    @objc public func setSize(_ size: CGSize) {
         nsh_component_set_size(handle, Double(size.width), Double(size.height))
     }
 }
@@ -559,16 +845,23 @@ private func jsonText(_ value: Any?) -> String? {
 /// The answer to a call of the app (`host.call` in `nsh/host`): give it once,
 /// from any thread, with ``resolve(_:)`` or ``reject(_:)``. A reply released
 /// unanswered fails the call. A post's reply (``isPost``) goes nowhere.
-public final class NshHostReply: @unchecked Sendable {
+@objc(NshHostReply)
+public final class NshHostReply: NSObject, @unchecked Sendable {
     private var call: OpaquePointer?
     private let lock = NSLock()
 
     /// Whether this answers a post (`host.post`), which expects none.
-    public let isPost: Bool
+    @objc public let isPost: Bool
+
+    @available(*, unavailable)
+    override init() {
+        fatalError("NshHostReply comes from a host call")
+    }
 
     fileprivate init(_ call: OpaquePointer?) {
         self.call = call
         isPost = call == nil
+        super.init()
     }
 
     private func take() -> OpaquePointer? {
@@ -581,6 +874,7 @@ public final class NshHostReply: @unchecked Sendable {
 
     /// Answers with `value` (anything `JSONSerialization` takes; `nil` is
     /// `null`): the app's promise resolves with it.
+    @objc(resolve:)
     public func resolve(_ value: Any? = nil) {
         guard let call = take() else { return }
         guard let json = jsonText(value) else {
@@ -590,7 +884,7 @@ public final class NshHostReply: @unchecked Sendable {
     }
 
     /// Fails the call: the app's promise rejects with an `Error` of `message`.
-    public func reject(_ message: String) {
+    @objc public func reject(_ message: String) {
         guard let call = take() else { return }
         nsh_host_call_reject(call, message)
     }
@@ -612,6 +906,7 @@ extension NshAppView {
     /// (`nsh/host`). An app that does not listen to `name` yet keeps the event
     /// until it does; while no app runs, it waits for the next one loaded. It
     /// never waits for the app.
+    @objc(sendEvent:data:)
     public func send(_ name: String, _ data: Any? = nil) {
         guard let json = jsonText(data) else {
             return print("[nsh] event \(name): data is not JSON")
@@ -627,7 +922,7 @@ extension NshAppView {
     /// `openURLContexts`, for example), to the running app: its
     /// `UrlScheme.on("open")` listeners get it (`nsh`). While no app runs, the
     /// next one loaded gets it.
-    public func openURL(_ url: URL) {
+    @objc public func openURL(_ url: URL) {
         do {
             try check(url.absoluteString.withCString { nsh_app_open_url(app, $0) })
         } catch {
@@ -641,6 +936,15 @@ extension NshAppView {
     /// `nil` for `null`) and the reply, which it gives once, now or later,
     /// from any thread. The app's calls of a name without a handler fail at
     /// once.
+    /// Handles `host.call` / `host.post` of `name` for Objective-C. `handler`
+    /// runs on the main thread. The `async` Swift overload stays Swift-only.
+    @objc(handleCall:handler:)
+    public func handleCall(
+        _ name: String, handler: @escaping (Any?, NshHostReply) -> Void
+    ) {
+        handle(name) { data, reply in handler(data, reply) }
+    }
+
     public func handle(_ name: String, _ handler: @escaping @MainActor (_ data: Any?, _ reply: NshHostReply) -> Void) {
         let box = Unmanaged.passRetained(HostHandlerBox(handler)).toOpaque()
         nsh_app_set_host_handler(
@@ -674,7 +978,7 @@ extension NshAppView {
 
     /// Removes the handler of `name`: the app's calls of it fail at once from
     /// now on, its posts are dropped.
-    public func removeHandler(_ name: String) {
+    @objc public func removeHandler(_ name: String) {
         nsh_app_set_host_handler(app, name, nil, nil, nil)
     }
 
@@ -685,7 +989,7 @@ extension NshAppView {
     /// for the system to open it (`UIApplication.open`). `nil` (the default):
     /// the system opens every URL. URLs reach it checked and granted (the
     /// app's `openUrl` capability).
-    public var onOpenURL: (@MainActor (URL) -> Bool)? {
+    @objc public var onOpenURL: (@MainActor (URL) -> Bool)? {
         get { openURLHandler }
         set {
             openURLHandler = newValue
@@ -763,6 +1067,15 @@ extension NshAppView {
         )
         nsh_app_register_component_with_animation(app, name, factory, &callbacks, &animated)
     }
+
+    /// ``register(component:_:)`` for Objective-C. `factory` makes one component
+    /// for every element created from now on.
+    @objc(registerComponentWithName:factory:)
+    public func registerObjCComponent(
+        name: String, factory: @escaping (NshComponentContext) -> NshObjCComponent
+    ) {
+        register(component: name) { context in ObjCComponentAdapter(factory(context)) }
+    }
 }
 
 /// Hears a scroll view the host watches (`NshAppView.watchScroll`) come and
@@ -776,6 +1089,24 @@ public protocol NshScrollWatcher: AnyObject {
     @MainActor func onDetached()
 }
 
+/// ``NshScrollWatcher`` for Objective-C.
+@objc(NshScrollWatcher)
+public protocol NshObjCScrollWatcher: NSObjectProtocol {
+    /// The scroll view is there.
+    func onAttached(_ handle: NshScrollHandle)
+    /// The scroll view is gone: its handle is dead.
+    func onDetached()
+}
+
+/// Forwards to an Objective-C scroll watcher.
+@MainActor
+private final class ObjCScrollWatcherAdapter: NshScrollWatcher {
+    let watcher: NshObjCScrollWatcher
+    init(_ watcher: NshObjCScrollWatcher) { self.watcher = watcher }
+    func onAttached(_ handle: NshScrollHandle) { watcher.onAttached(handle) }
+    func onDetached() { watcher.onDetached() }
+}
+
 /// A `<Scroll>` of the app, for native UI of the host that follows or drives
 /// the app's scrolling in the frame of the scroll, without a round trip
 /// through JS: a sheet under the content that the end of the content pulls
@@ -785,40 +1116,49 @@ public protocol NshScrollWatcher: AnyObject {
 /// Once the scroll view is deleted, loses its `nativeID` or its app stops,
 /// `isAlive` is false, reads give 0 and the rest does nothing.
 @MainActor
-public final class NshScrollHandle {
+@objc(NshScrollHandle)
+public final class NshScrollHandle: NSObject {
     private let handle: OpaquePointer
 
-    init(_ handle: OpaquePointer) { self.handle = handle }
+    @available(*, unavailable)
+    override init() {
+        fatalError("NshScrollHandle comes from a scroll watcher")
+    }
+
+    init(_ handle: OpaquePointer) {
+        self.handle = handle
+        super.init()
+    }
 
     deinit { nsh_scroll_handle_free(handle) }
 
     /// Whether the scroll view is still the app's, with the watched `nativeID`.
-    public var isAlive: Bool { nsh_scroll_handle_is_alive(handle) }
+    @objc public var isAlive: Bool { nsh_scroll_handle_is_alive(handle) }
     /// The horizontal offset.
-    public var scrollX: CGFloat { nsh_scroll_handle_scroll_x(handle) }
+    @objc public var scrollX: CGFloat { nsh_scroll_handle_scroll_x(handle) }
     /// The vertical offset.
-    public var scrollY: CGFloat { nsh_scroll_handle_scroll_y(handle) }
+    @objc public var scrollY: CGFloat { nsh_scroll_handle_scroll_y(handle) }
     /// The content's width (at least the viewport's).
-    public var contentWidth: CGFloat { nsh_scroll_handle_content_width(handle) }
+    @objc public var contentWidth: CGFloat { nsh_scroll_handle_content_width(handle) }
     /// The content's height (at least the viewport's).
-    public var contentHeight: CGFloat { nsh_scroll_handle_content_height(handle) }
+    @objc public var contentHeight: CGFloat { nsh_scroll_handle_content_height(handle) }
     /// The visible width.
-    public var viewportWidth: CGFloat { nsh_scroll_handle_viewport_width(handle) }
+    @objc public var viewportWidth: CGFloat { nsh_scroll_handle_viewport_width(handle) }
     /// The visible height.
-    public var viewportHeight: CGFloat { nsh_scroll_handle_viewport_height(handle) }
+    @objc public var viewportHeight: CGFloat { nsh_scroll_handle_viewport_height(handle) }
     /// The view the app's content is laid out in: the positions of the views
     /// inside are relative to it. `nil` once the scroll view is gone.
-    public var contentView: UIView? { nsh_scroll_handle_content_view(handle) }
+    @objc public var contentView: UIView? { nsh_scroll_handle_content_view(handle) }
 
     /// Scrolls by `dx`, `dy`, clamped to the content, as the user's scroll
     /// would (the app's `onScroll` hears it); `animated` uses UIKit's
     /// animation.
-    public func scrollBy(dx: CGFloat, dy: CGFloat, animated: Bool) {
+    @objc public func scrollBy(dx: CGFloat, dy: CGFloat, animated: Bool) {
         nsh_scroll_handle_scroll_by(handle, dx, dy, animated)
     }
 
     /// Ends a fling or an animated scroll where it is; nothing at rest.
-    public func stopScrolling() { nsh_scroll_handle_stop_scrolling(handle) }
+    @objc public func stopScrolling() { nsh_scroll_handle_stop_scrolling(handle) }
 
     /// Calls `f(scrollX, scrollY, dx, dy)` on every offset change (`dx` /
     /// `dy` positive: the content moved left / up), in the frame of the
@@ -865,6 +1205,55 @@ public final class NshScrollHandle {
             nsh_scroll_handle_remove_listener(self.handle, id)
         }
     }
+
+    /// ``onScroll(_:)`` for Objective-C. Returns an id to pass to
+    /// ``removeListener(_:)``; `0` means the scroll view is already gone.
+    @objc(addScrollListener:)
+    @discardableResult
+    public func addScrollListener(
+        _ listener: @escaping (CGFloat, CGFloat, CGFloat, CGFloat) -> Void
+    ) -> UInt64 {
+        let box = Unmanaged.passRetained(ScrollListenerBox { x, y, dx, dy in
+            listener(x, y, dx, dy)
+        }).toOpaque()
+        return nsh_scroll_handle_on_scroll(
+            handle,
+            { context, x, y, dx, dy in
+                let box = Unmanaged<ScrollListenerBox>.fromOpaque(context!).takeUnretainedValue()
+                MainActor.assumeIsolated { box.onScroll(x, y, dx, dy) }
+            },
+            box,
+            { context in Unmanaged<ScrollListenerBox>.fromOpaque(context!).release() }
+        )
+    }
+
+    /// ``onContentSizeChange(_:)`` for Objective-C. Returns an id to pass to
+    /// ``removeListener(_:)``; `0` means the scroll view is already gone.
+    @objc(addContentSizeListener:)
+    @discardableResult
+    public func addContentSizeListener(
+        _ listener: @escaping (CGFloat, CGFloat) -> Void
+    ) -> UInt64 {
+        let box = Unmanaged.passRetained(ContentSizeListenerBox { width, height in
+            listener(width, height)
+        }).toOpaque()
+        return nsh_scroll_handle_on_content_size_change(
+            handle,
+            { context, width, height in
+                let box = Unmanaged<ContentSizeListenerBox>.fromOpaque(context!).takeUnretainedValue()
+                MainActor.assumeIsolated { box.onChange(width, height) }
+            },
+            box,
+            { context in Unmanaged<ContentSizeListenerBox>.fromOpaque(context!).release() }
+        )
+    }
+
+    /// Stops a listener from ``addScrollListener(_:)`` or
+    /// ``addContentSizeListener(_:)``.
+    @objc(removeListener:)
+    public func removeListener(_ id: UInt64) {
+        nsh_scroll_handle_remove_listener(handle, id)
+    }
 }
 
 private final class ScrollListenerBox {
@@ -907,5 +1296,15 @@ extension NshAppView {
             release: { context in Unmanaged<ScrollWatcherBox>.fromOpaque(context!).release() }
         )
         nsh_app_watch_scroll(app, nativeID, box, &callbacks)
+    }
+
+    /// ``watchScroll(_:_:)`` for Objective-C. `nil` stops watching.
+    @objc(watchScrollWithNativeID:watcher:)
+    public func watchScroll(nativeID: String, watcher: NshObjCScrollWatcher?) {
+        guard let watcher else {
+            watchScroll(nativeID, nil)
+            return
+        }
+        watchScroll(nativeID, ObjCScrollWatcherAdapter(watcher))
     }
 }
